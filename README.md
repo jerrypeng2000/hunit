@@ -39,7 +39,7 @@
 
 ## 安装方法
 
-1. 下载 `release/hunit-v1.1.0-chromium.zip`。
+1. 下载 `release/hunit-v1.1.1-chromium.zip`。
 2. 解压到固定文件夹。
 3. 打开浏览器扩展管理页：
    - Chrome：`chrome://extensions`
