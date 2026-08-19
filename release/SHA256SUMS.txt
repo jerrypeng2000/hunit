@@ -1,2 +1,2 @@
-2e9d9456153b712fdb95fabcc9054956858e30ac72bf24bd82921e3aaad6d5a0  hunit-v1.1.2-chromium.zip
-e0d5c0d93a8f9b9bca2c86cac8d109102b6217c9adc54ce4794206fa4897da9b  hunit-v1.1.2-src.zip
+fa80dfe04f6eff65f68850e2349ad43ea11ac3b555a0b99eb9c457f2559886e0  hunit-v1.1.3-chromium.zip
+ad8f0d7666b17ea4055f2a0ccaadb98d33c377575f847fe3a63dc88f510855bd  hunit-v1.1.3-src.zip
