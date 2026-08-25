@@ -1,17 +1,20 @@
 /**
- * AjkAPI client SDK reference implementation (Application Interface Standard v3.0).
+ * AjkAPI client SDK reference implementation (Application Interface Standard v3.2).
  *
  * Minimal contract every client should expose:
- *   resolveApp, getEntitlement, getModels, consume, subscribe, unsubscribe, redeem
+ *   getCapabilities, resolveApp, getEntitlement, getModels, consume, subscribe, unsubscribe, redeem
  *
- * v3.0 additions:
+ * v3.0/v3.1 additions:
  *   - getModels(): app model list (default / switch / multimodal / auto)
  *   - consume(count, opts): opts.model_name marks an AI call, opts.feature marks a free feature
  *   - subscribe(mode): 'monthly' (basic subscription) or 'one_time' (lifetime buyout)
  *   - redeem(key): redeem a code (balance / AI credits pack) directly in the client
  *
- * Dependency-free so it can be copied into extensions, desktop web apps,
- * Electron renderers, mobile WebViews, or games.
+ * Dependency-free transport reference. Each platform MUST replace the settings
+ * storage with its secure adapter described in section 12 of the standard:
+ * H5 uses a same-origin BFF/HttpOnly cookie, desktop uses the OS credential
+ * vault, Android uses Keystore, iOS uses Keychain, and MV3 extensions prefer
+ * chrome.storage.session. Do not persist a long-lived token in localStorage.
  */
 
 const DEFAULTS = {
@@ -23,7 +26,37 @@ const DEFAULTS = {
 };
 
 const STORAGE_KEY = 'ajkapi-app-settings';
+const SESSION_TOKEN_KEY = 'ajkapi-access-token';
 const FREE_DAILY_QUOTA = 10;
+let runtimeAccessToken = '';
+let runtimeLocalUsage = { date: '', used: 0 };
+
+/**
+ * getCapabilities v3.2: negotiate features with public, private, and OEM
+ * deployments instead of guessing from a hostname or server version.
+ */
+async function getCapabilities() {
+  const settings = readSettings();
+  const { status, body } = await fetchJson(endpoint(settings, 'v1/capabilities'), {
+    headers: { Accept: 'application/json' },
+  });
+  if (status !== 200 || !body || body.object !== 'gateway.capabilities') {
+    throw new Error(`Capability negotiation failed (${status})`);
+  }
+  return body;
+}
+
+function getStorage(kind) {
+  try {
+    const storage = globalThis[kind];
+    const probe = `__ajkapi_probe_${kind}`;
+    storage?.setItem(probe, '1');
+    storage?.removeItem(probe);
+    return storage || null;
+  } catch {
+    return null;
+  }
+}
 
 function todayKey() {
   const d = new Date();
@@ -32,20 +65,39 @@ function todayKey() {
 }
 
 function readSettings() {
+  const persistent = getStorage('localStorage');
+  const session = getStorage('sessionStorage');
   try {
-    return Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'));
+    const publicSettings = JSON.parse(persistent?.getItem(STORAGE_KEY) || '{}');
+    // Tokens are session-only in this browser reference. Native clients must
+    // replace this with their OS vault/Keystore/Keychain adapter.
+    const accessToken = runtimeAccessToken || session?.getItem(SESSION_TOKEN_KEY) || '';
+    return Object.assign({}, DEFAULTS, publicSettings, { accessToken });
   } catch {
-    return Object.assign({}, DEFAULTS);
+    return Object.assign({}, DEFAULTS, { accessToken: runtimeAccessToken });
   }
 }
 
 function writeSettings(next) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  const persistent = getStorage('localStorage');
+  const session = getStorage('sessionStorage');
+  const publicSettings = Object.assign({}, next);
+  runtimeAccessToken = String(publicSettings.accessToken || '');
+  delete publicSettings.accessToken;
+  persistent?.setItem(STORAGE_KEY, JSON.stringify(publicSettings));
+  if (runtimeAccessToken) {
+    session?.setItem(SESSION_TOKEN_KEY, runtimeAccessToken);
+  } else {
+    session?.removeItem(SESSION_TOKEN_KEY);
+  }
 }
 
 function readLocalUsage() {
+  const persistent = getStorage('localStorage');
   try {
-    const data = JSON.parse(localStorage.getItem('ajkapi-local-usage') || '{}');
+    const data = persistent
+      ? JSON.parse(persistent.getItem('ajkapi-local-usage') || '{}')
+      : runtimeLocalUsage;
     return data.date === todayKey() ? data : { date: todayKey(), used: 0 };
   } catch {
     return { date: todayKey(), used: 0 };
@@ -53,14 +105,14 @@ function readLocalUsage() {
 }
 
 function writeLocalUsage(usage) {
-  localStorage.setItem('ajkapi-local-usage', JSON.stringify(usage));
+  runtimeLocalUsage = usage;
+  getStorage('localStorage')?.setItem('ajkapi-local-usage', JSON.stringify(usage));
 }
 
 function headers(settings) {
-  return {
-    'Content-Type': 'application/json',
-    Authorization: settings.accessToken || '',
-  };
+  const result = { 'Content-Type': 'application/json' };
+  if (settings.accessToken) result.Authorization = settings.accessToken;
+  return result;
 }
 
 function endpoint(settings, apiPath) {
@@ -101,7 +153,7 @@ function localEntitlement(errorMsg = '') {
     monthly_price_quota: 0,
     monthly_price_yuan: 0,
     monthly_duration_days: 30,
-    auto_renew: true,
+    auto_renew: false,
     renew_failed: false,
     need_recharge: false,
     recharge_url: '',
@@ -126,7 +178,9 @@ async function resolveApp(settings) {
 
 async function getEntitlement() {
   let settings = readSettings();
-  if (!settings.accessToken) return localEntitlement('Not connected to AjkAPI');
+  if (!settings.accessToken && !settings.proxyPath) {
+    return localEntitlement('Not connected to AjkAPI');
+  }
 
   settings = await resolveApp(settings);
   if (!settings.appId) return localEntitlement('App slug was not found');
@@ -168,7 +222,9 @@ async function getEntitlement() {
  */
 async function getModels() {
   const settings = readSettings();
-  if (!settings.accessToken || !settings.appId) return { models: [], auto_select: false };
+  if ((!settings.accessToken && !settings.proxyPath) || !settings.appId) {
+    return { models: [], auto_select: false };
+  }
   const { status, body } = await fetchJson(
     endpoint(settings, `api/billing/app-models?app_id=${settings.appId}`),
     { headers: headers(settings) }
@@ -184,11 +240,12 @@ async function getModels() {
  * opts: { model_name?: string, feature?: string, token_count?: number }
  *   - model_name non-empty => AI call (billed against AI credits when the basic
  *     subscription excludes AI). Pass the model chosen via getModels().
- *   - feature matching the backend free_features list => this call is free.
+ *   - feature matching free_features is free only when model_name is empty.
+ *     AI calls always use metered credits, bounded quota, or balance.
  */
 async function consume(count = 1, opts = {}) {
   let settings = readSettings();
-  if (!settings.accessToken) return localConsume(count);
+  if (!settings.accessToken && !settings.proxyPath) return localConsume(count);
   settings = await resolveApp(settings);
 
   const requestId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
@@ -255,7 +312,7 @@ function localConsume(count) {
  */
 async function subscribe(mode = 'monthly') {
   let settings = readSettings();
-  if (!settings.accessToken) throw new Error('Connect to AjkAPI first');
+  if (!settings.accessToken && !settings.proxyPath) throw new Error('Connect to AjkAPI first');
   settings = await resolveApp(settings);
   const requestId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
   const { status, body } = await fetchJson(endpoint(settings, 'api/billing/app-subscribe'), {
@@ -274,7 +331,7 @@ async function subscribe(mode = 'monthly') {
 
 async function unsubscribe() {
   let settings = readSettings();
-  if (!settings.accessToken) throw new Error('Connect to AjkAPI first');
+  if (!settings.accessToken && !settings.proxyPath) throw new Error('Connect to AjkAPI first');
   settings = await resolveApp(settings);
   const { status, body } = await fetchJson(endpoint(settings, 'api/billing/app-unsubscribe'), {
     method: 'POST',
@@ -293,7 +350,7 @@ async function unsubscribe() {
  */
 async function redeem(key) {
   const settings = readSettings();
-  if (!settings.accessToken) throw new Error('Connect to AjkAPI first');
+  if (!settings.accessToken && !settings.proxyPath) throw new Error('Connect to AjkAPI first');
   const { status, body } = await fetchJson(endpoint(settings, 'api/billing/redeem'), {
     method: 'POST',
     headers: headers(settings),
@@ -320,6 +377,7 @@ async function listCreditsPackages() {
 }
 
 export const AjkApiClient = {
+  getCapabilities,
   readSettings,
   writeSettings,
   resolveApp,
